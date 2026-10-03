@@ -5,15 +5,17 @@ import base64
 import io
 import zipfile
 from unittest.mock import patch
+from types import SimpleNamespace
+import json
 from model_setup import ensure_model, MODEL_NAME
 from pathlib import Path
 os.environ['APPDATA'] = tempfile.mkdtemp(prefix='wordframe-test-')
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-from core import match_rules
+from core import match_rules, alternatives, LiveMatcher
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPixmap, QColor
 from PySide6.QtTest import QTest
-from app import App, CONFIG
+from app import App, CONFIG, Listener
 
 class Tests(unittest.TestCase):
     def setUp(self):
@@ -30,6 +32,86 @@ class Tests(unittest.TestCase):
         self.assertIsNone(match_rules('cat', [dict(word='cat', enabled=False)]))
         self.assertEqual(match_rules('cat hello world', [cat, phrase]), phrase)
         self.assertEqual(match_rules('hello world', [dict(word='hello'), phrase]), phrase)
+    def test_comma_alternatives(self):
+        rule = dict(word='Hello, hi, greetings, good morning')
+        for text in ['hello!', 'HI there', 'greetings everyone', 'a good morning to you']:
+            self.assertEqual(match_rules(text, [rule]), rule)
+        self.assertIsNone(match_rules('high morning', [rule]))
+        self.assertEqual(alternatives(' hello, , HI '), [('hello',), ('hi',)])
+    def test_live_multiple_occurrences_and_final(self):
+        rules = [dict(word='hello, hi'), dict(word='cat'), dict(word='good morning')]
+        matcher = LiveMatcher()
+        self.assertEqual([h.rule_index for h in matcher.feed('hello', rules)], [0])
+        self.assertEqual(matcher.feed('hello', rules), [])
+        self.assertEqual([h.rule_index for h in matcher.feed('hello cat', rules)], [1])
+        self.assertEqual([h.rule_index for h in matcher.feed('hello cat hi good', rules)], [0])
+        self.assertEqual([h.rule_index for h in matcher.feed('hello cat hi good morning', rules)], [2])
+        self.assertEqual(matcher.feed('hello cat hi good morning', rules, final=True), [])
+        self.assertEqual([h.rule_index for h in matcher.feed('hello', rules)], [0])
+        self.assertEqual([h.rule_index for h in matcher.feed('hello hello', rules)], [0])
+    def test_live_revisions_and_final_only(self):
+        matcher = LiveMatcher()
+        rules = [dict(word='hello'), dict(word='cat')]
+        self.assertEqual(len(matcher.feed('hello', rules)), 1)
+        self.assertEqual(matcher.feed('well hello', rules), [])
+        self.assertEqual(matcher.feed('well hello there', rules), [])
+        hits = matcher.feed('well hello there cat', rules, final=True)
+        self.assertEqual([h.rule_index for h in hits], [1])
+        self.assertEqual([h.rule_index for h in matcher.feed('hello cat hello', rules, final=True)], [0, 1, 0])
+        matcher.feed('hello', rules)
+        matcher.feed('', rules, final=True)
+        self.assertEqual(len(matcher.feed('hello', rules)), 1)
+    def test_listener_emits_partial_and_final(self):
+        worker = Listener('mock-model', None)
+        received = []
+        worker.transcript.connect(lambda text, final: received.append((text, final)))
+        class Stream:
+            def __init__(self, **kwargs):
+                self.callback = kwargs['callback']
+                self.blocksize = kwargs['blocksize']
+                self.assert_blocksize = self.blocksize == 800
+            def __enter__(self):
+                for _ in range(3):
+                    self.callback(b'audio', 800, None, None)
+                return self
+            def __exit__(self, *args): pass
+        class Recognizer:
+            def __init__(self, *args): self.step = 0
+            def AcceptWaveform(self, chunk):
+                self.step += 1
+                return self.step == 3
+            def PartialResult(self):
+                return json.dumps({'partial': 'hello' if self.step == 1 else 'hello cat'})
+            def Result(self):
+                worker.requestInterruption()
+                # Direct run() isn't a running QThread; stop the loop via a test-controlled flag.
+                worker.isInterruptionRequested = lambda: True
+                return json.dumps({'text': 'hello cat'})
+        sd = SimpleNamespace(query_devices=lambda *args: {'default_samplerate': 16000}, RawInputStream=Stream)
+        vosk = SimpleNamespace(Model=lambda path: object(), KaldiRecognizer=Recognizer, SetLogLevel=lambda level: None)
+        with patch.dict('sys.modules', {'sounddevice': sd, 'vosk': vosk}):
+            worker.run()
+        self.assertEqual(received, [('hello', False), ('hello cat', False), ('hello cat', True)])
+    def test_live_display_no_timer_restart(self):
+        app = App()
+        paths = []
+        for color in ['red', 'blue']:
+            path = Path(os.environ['APPDATA']) / (color + '.png')
+            image = QPixmap(10, 10); image.fill(QColor(color)); image.save(str(path))
+            paths.append(str(path))
+        app.rules = [dict(word='hello, hi', image=paths[0], duration=2), dict(word='cat', image=paths[1], duration=2)]
+        app.detect_live('hello', False)
+        self.assertEqual(app.output.pixmap.toImage().pixelColor(0, 0).name(), '#ff0000')
+        QTest.qWait(100)
+        remaining = app.timer.remainingTime()
+        app.detect_live('hello there', False)
+        self.assertLessEqual(app.timer.remainingTime(), remaining)
+        app.detect_live('hello there cat', False)
+        self.assertEqual(app.output.pixmap.toImage().pixelColor(0, 0).name(), '#0000ff')
+        app.detect_live('hello there cat hi', False)
+        self.assertEqual(app.output.pixmap.toImage().pixelColor(0, 0).name(), '#ff0000')
+        app.detect_live('hello there cat hi', True)
+        app.close()
     def test_display_save_clear(self):
         app = App()
         imagepath = Path(os.environ['APPDATA']) / 'test.png'
