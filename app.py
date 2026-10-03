@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor, QPainter, QPixmap, QMovie, QImageReader
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QLineEdit, QFileDialog, QSpinBox,
     QComboBox, QListWidget, QCheckBox, QScrollArea, QMessageBox, QFrame)
-from core import match_rules
+from core import match_rules, alternatives, LiveMatcher
 from model_setup import ensure_model, valid_model
 
 DATA = Path(os.getenv('APPDATA') or Path.home()) / 'WordFrame'
@@ -78,7 +78,7 @@ class ModelInstaller(QThread):
             self.failure.emit('Model download failed: ' + str(error) + ' • Check internet and press Start listening to retry.')
 
 class Listener(QThread):
-    transcript = Signal(str)
+    transcript = Signal(str, bool)
     status = Signal(str)
     failure = Signal(str)
     def __init__(self, model, device):
@@ -101,7 +101,7 @@ class Listener(QThread):
                     audio.put_nowait(bytes(data))
                 except queue.Full:
                     pass
-            with sd.RawInputStream(samplerate=rate, blocksize=4000, device=self.device,
+            with sd.RawInputStream(samplerate=rate, blocksize=max(800, int(rate * 0.05)), device=self.device,
                                    dtype='int16', channels=1, callback=callback):
                 self.status.emit('Listening • microphone active')
                 while not self.isInterruptionRequested():
@@ -109,10 +109,11 @@ class Listener(QThread):
                         chunk = audio.get(timeout=0.2)
                     except queue.Empty:
                         continue
-                    if recognizer.AcceptWaveform(chunk):
-                        text = json.loads(recognizer.Result()).get('text', '')
-                        if text:
-                            self.transcript.emit(text)
+                    final = recognizer.AcceptWaveform(chunk)
+                    result = json.loads(recognizer.Result() if final else recognizer.PartialResult())
+                    text = result.get('text' if final else 'partial', '')
+                    # Empty finals also reset occurrence tracking for the next segment.
+                    self.transcript.emit(text, final)
         except Exception as error:
             self.failure.emit(str(error))
 
@@ -122,6 +123,7 @@ class App(QMainWindow):
         self.setWindowTitle('WordFrame | Voice to visual')
         self.resize(1120, 860)
         self.rules, self.worker = [], None
+        self.live_matcher = LiveMatcher()
         self.image_path = ''
         self.idle_path = ''
         self.movie = None
@@ -156,8 +158,9 @@ class App(QMainWindow):
         self.rule_list.currentRowChanged.connect(self.select_rule)
         left.addWidget(self.rule_list, 1)
         self.word = QLineEdit()
-        self.word.setPlaceholderText('Trigger word or phrase, e.g. hello')
+        self.word.setPlaceholderText('Triggers: hello, hi, greetings')
         left.addWidget(self.word)
+        left.addWidget(self.label('Commas mean OR. Example: hello, hi, good morning', 'muted'))
         self.file_label = self.label('No image or GIF selected', 'muted')
         left.addWidget(self.file_label)
         left.addWidget(self.button('Choose image or GIF…', self.choose_image))
@@ -302,13 +305,16 @@ class App(QMainWindow):
         self.rule_list.setCurrentRow(selected)
     def save_rule(self):
         word = self.word.text().strip()
-        from core import tokens
-        if not tokens(word) or not self.image_path or not QImageReader(self.image_path).canRead():
-            QMessageBox.warning(self, 'Rule needs details', 'Enter a word or phrase and choose a readable image.')
+        if not alternatives(word) or not self.image_path or not QImageReader(self.image_path).canRead():
+            QMessageBox.warning(self, 'Rule needs details', 'Enter one or more comma-separated triggers and choose an image or GIF.')
             return
         index = self.rule_list.currentRow()
-        if any(tokens(r['word']) == tokens(word) for i, r in enumerate(self.rules) if i != index):
-            QMessageBox.warning(self, 'Duplicate trigger', 'A rule already uses this trigger.')
+        phrases = alternatives(word)
+        if len(phrases) != len(set(phrases)):
+            QMessageBox.warning(self, 'Repeated trigger', 'Each comma-separated trigger must be unique.')
+            return
+        if any(set(alternatives(r['word'])) & set(phrases) for i, r in enumerate(self.rules) if i != index):
+            QMessageBox.warning(self, 'Duplicate trigger', 'Another rule already uses one of these triggers. Edit that rule or remove the repeated trigger.')
             return
         source = Path(self.image_path)
         if source.parent != DATA / 'images':
@@ -325,6 +331,7 @@ class App(QMainWindow):
         else:
             self.rules.append(rule)
             index = len(self.rules)-1
+        self.live_matcher.reset()
         self.persist()
         self.refresh_rules(index)
         self.notify('Rule saved • type a test sentence or click Start listening')
@@ -332,6 +339,7 @@ class App(QMainWindow):
         index = self.rule_list.currentRow()
         if index >= 0:
             self.rules.pop(index)
+            self.live_matcher.reset()
             self.persist()
             self.refresh_rules()
             self.new_rule()
@@ -407,12 +415,18 @@ class App(QMainWindow):
     def clear_output(self):
         self.timer.stop()
         self.show_media('')
+    def detect_live(self, text, final):
+        self.heard.setText(('Heard: ' if final else 'Hearing: ') + text)
+        for hit in self.live_matcher.feed(text, self.rules, final):
+            self.display_rule(self.rules[hit.rule_index], ' '.join(hit.phrase))
     def detect(self, text):
         self.heard.setText('Heard: ' + text)
         rule = match_rules(text, self.rules)
         if not rule:
             self.notify('No matching word in this sentence')
             return
+        self.display_rule(rule)
+    def display_rule(self, rule, trigger=None):
         if not self.show_media(rule['image']):
             self.show_idle()
             self.notify('Rule visual is missing or unreadable • choose it again')
@@ -420,7 +434,7 @@ class App(QMainWindow):
         self.timer.stop()
         if rule['duration']:
             self.timer.start(rule['duration']*1000)
-        self.notify('Showing visual for: ' + rule['word'])
+        self.notify('Showing visual for: ' + (trigger or rule['word']))
     def toggle_listening(self):
         if self.worker and self.worker.isRunning():
             self.worker.requestInterruption()
@@ -457,7 +471,8 @@ class App(QMainWindow):
             self.stopped()
     def start_listener(self, path):
         self.worker = Listener(path, self.devices.currentData())
-        self.worker.transcript.connect(self.detect)
+        self.live_matcher.reset()
+        self.worker.transcript.connect(self.detect_live)
         self.worker.status.connect(self.notify)
         self.worker.failure.connect(lambda error: self.notify('Microphone error: ' + error))
         self.worker.finished.connect(self.stopped)
